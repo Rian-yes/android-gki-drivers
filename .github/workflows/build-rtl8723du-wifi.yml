@@ -1,0 +1,467 @@
+name: Build Realtek RTW88 Wi-Fi (parametrized)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kbranch:
+        description: "ACK branch matching your kernel: android12-5.10 | android13-5.15 | android14-6.1 | android15-6.6"
+        required: true
+        default: "android13-5.15"
+      kcommit:
+        description: "Exact ACK commit (COMMIT_SHORT / full hash). Overrides kbranch tip if set."
+        required: true
+        default: "e787d6ac4af04c06a0120ad773820d43f9b851a9"
+      clang_ver:
+        description: "Android Clang version (e.g. clang-r450784d). See device-profile.txt / notes."
+        required: true
+        default: "clang-r450784d"
+      btf:
+        description: "Keep CONFIG_DEBUG_INFO_BTF? (y/n)"
+        required: true
+        default: "y"
+      lto:
+        description: "LTO mode to match device: full | thin | none"
+        required: true
+        default: "thin"
+      driver:
+        description: "RTW88 driver: rtl8723du | rtl8821cu | rtl8822bu | rtl8822cu | rtl8812au | rtl8814au | rtl8821au | all"
+        required: true
+        default: "rtl8723du"
+      oot_repo:
+        description: "Git URL of the RTW88 driver repo"
+        required: true
+        default: "https://github.com/lwfinger/rtw88"
+      oot_branch:
+        description: "Branch/tag of the driver repo"
+        required: true
+        default: "master"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repo (needed for packaging/ templates)
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "branch  = ${{ github.event.inputs.kbranch }}"
+          echo "commit  = ${{ github.event.inputs.kcommit }}"
+          echo "clang   = ${{ github.event.inputs.clang_ver }}"
+          echo "btf     = ${{ github.event.inputs.btf }}"
+          echo "lto     = ${{ github.event.inputs.lto }}"
+          echo "driver  = ${{ github.event.inputs.driver }} (rtw88)"
+          echo "repo    = ${{ github.event.inputs.oot_repo }} @ ${{ github.event.inputs.oot_branch }}"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h
+
+      - name: Install deps
+        run: |
+          # 1) Reliable public DNS resolvers (Cloudflare, Google, Quad9)
+          sudo sh -c 'printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\n" > /etc/resolv.conf'
+
+          # 2) Populate multi-mirror fallback list
+          sudo sh -c 'cat > /etc/apt/apt-mirrors.txt << "EOF"
+          http://archive.ubuntu.com/ubuntu/
+          http://mirrors.edge.kernel.org/ubuntu/
+          http://ftp.osuosl.org/pub/ubuntu/
+          http://mirror.math.princeton.edu/pub/ubuntu/
+          EOF'
+          sudo sed -i 's|http://.*azure.*ubuntu.com/ubuntu/|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+
+          # 3) Resilient mirror update loop with automatic fallback
+          UPDATED=0
+          for M in "http://archive.ubuntu.com/ubuntu" "http://mirrors.edge.kernel.org/ubuntu" "http://ftp.osuosl.org/pub/ubuntu"; do
+            echo "Attempting apt update using mirror: $M"
+            sudo sed -i "s|http://archive.ubuntu.com/ubuntu|$M|g" /etc/apt/sources.list 2>/dev/null || true
+            if sudo apt-get update -y; then
+              UPDATED=1
+              break
+            fi
+            sleep 2
+          done
+
+          sudo apt-get install -y -o Acquire::Retries=5 --fix-missing \
+            bc bison flex libssl-dev libelf-dev \
+            lz4 cpio kmod git curl zip file dwarves
+          pahole --version
+
+      - name: Verify commit is public
+        run: |
+          H="${{ github.event.inputs.kcommit }}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+            "https://android.googlesource.com/kernel/common/+/$H")
+          echo "gitiles HTTP $CODE for $H"
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Commit $H is not public on ACK."
+            exit 1
+          fi
+
+      - name: Restore Kernel & Clang Cache
+        id: cache-kernel
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ks
+            clang
+          key: gki-kernel-${{ github.event.inputs.kcommit }}-${{ github.event.inputs.clang_ver }}-${{ github.event.inputs.lto }}-${{ github.event.inputs.btf }}
+
+      - name: Fetch kernel source (exact commit)
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ks
+          URL="https://android.googlesource.com/kernel/common/+archive/${{ github.event.inputs.kcommit }}.tar.gz"
+          ok=0
+          for try in 1 2 3 4 5; do
+            echo "kernel source download, attempt $try ..."
+            rm -f k.tar.gz
+            if curl -fsSL --retry 3 --retry-delay 3 --retry-all-errors \
+                 --http1.1 "$URL" -o k.tar.gz \
+               && gzip -t k.tar.gz 2>/dev/null; then
+              ok=1; break
+            fi
+            echo "  incomplete/corrupt, retrying..."; sleep 5
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Could not download the kernel source archive after 5 attempts."
+            exit 1
+          fi
+          tar -xzf k.tar.gz -C ks
+          rm -f k.tar.gz
+          ls ks/Makefile && head -3 ks/Makefile
+
+      - name: Fetch Android Clang
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p clang
+          CV="${{ github.event.inputs.clang_ver }}"
+          got=0
+          fetch() {
+            for try in 1 2 3; do
+              if curl -fsSL --retry 3 --retry-delay 2 "$1" -o c.tar.gz \
+                 && file c.tar.gz | grep -q gzip; then return 0; fi
+              echo "   retry $try failed"; sleep 3
+            done
+            return 1
+          }
+          for BR in android13-release android14-release android12-release android15-release android16-release main master; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/$BR/$CV.tar.gz"
+            echo "Trying $BR ..."
+            if fetch "$URL"; then
+              tar -xzf c.tar.gz -C clang && got=1 && echo "OK from $BR" && break
+            fi
+            rm -f c.tar.gz
+          done
+          if [ "$got" != "1" ]; then
+            echo "::error::Could not fetch $CV from any known branch."
+            exit 1
+          fi
+          clang/bin/clang --version
+
+      - name: Configure kernel
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        working-directory: ks
+        env:
+          BTF: ${{ github.event.inputs.btf }}
+          LTO: ${{ github.event.inputs.lto }}
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          {
+            echo "CONFIG_WLAN=y"
+            echo "CONFIG_CFG80211=m"
+            echo "CONFIG_USB=y"
+            echo "CONFIG_MAC80211=m"
+          } >> arch/arm64/configs/gki_defconfig
+
+          make LLVM=1 ARCH=arm64 O=out gki_defconfig
+
+          if [ "$BTF" != "y" ]; then
+            ./scripts/config --file out/.config -d DEBUG_INFO_BTF
+          fi
+          case "$LTO" in
+            thin) ./scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN ;;
+            none) ./scripts/config --file out/.config -d LTO_CLANG_FULL -d LTO_CLANG_THIN -e LTO_NONE ;;
+            *)    : ;;
+          esac
+
+          make LLVM=1 ARCH=arm64 O=out olddefconfig
+
+      - name: Prepare kernel for external modules
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        working-directory: ks
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make LLVM=1 ARCH=arm64 O=out modules_prepare
+
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+
+      - name: Build in-tree mac80211
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        working-directory: ks
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          make LLVM=1 ARCH=arm64 O=out -j$(nproc)
+
+      - name: Save Kernel & Clang Cache
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ks
+            clang
+          key: ${{ steps.cache-kernel.outputs.cache-primary-key || format('gki-kernel-{0}-{1}-{2}-{3}', github.event.inputs.kcommit, github.event.inputs.clang_ver, github.event.inputs.lto, github.event.inputs.btf) }}
+
+      - name: Build RTW88 driver
+        env:
+          DRIVER: ${{ github.event.inputs.driver }}
+          OOT_REPO: ${{ github.event.inputs.oot_repo }}
+          OOT_BRANCH: ${{ github.event.inputs.oot_branch }}
+        run: |
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+          git clone --depth 1 -b "$OOT_BRANCH" "$OOT_REPO" oot || \
+          git clone --depth 1 "$OOT_REPO" oot
+          cd oot
+
+          echo "Applying 5.15+ compatibility patches..."
+          sed -i 's/device_get_mac_address([^)]*)/1/g' main.c 2>/dev/null || true
+          sed -i 's/ieee80211_purge_tx_queue(rtwdev->hw, &txcb->tx_ack_queue);/skb_queue_purge(\&txcb->tx_ack_queue);/g' usb.c 2>/dev/null || true
+
+          echo "Writing targeted Makefile for $DRIVER..."
+          cat > Makefile << 'EOF'
+          ccflags-y += -O2 -std=gnu11 -Wno-declaration-after-statement -Wno-error
+          ccflags-y += -DCONFIG_RTW88_LEDS=1
+          ccflags-y += -DCONFIG_RTW88_DEBUG=1
+          ccflags-y += -DCONFIG_RTW88_DEBUGFS=1
+          ccflags-y += -D__CHECK_ENDIAN__
+
+          obj-m := rtw_core.o rtw_usb.o
+          rtw_core-objs := main.o led.o mac80211.o util.o debug.o tx.o rx.o mac.o phy.o coex.o efuse.o fw.o ps.o sec.o bf.o regd.o sar.o wow.o
+          rtw_usb-objs  := usb.o
+          EOF
+
+          case "$DRIVER" in
+            rtl8723du)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8723d.o rtw_8723du.o rtw_8723x.o
+          rtw_8723d-objs  := rtw8723d.o rtw8723d_table.o
+          rtw_8723du-objs := rtw8723du.o
+          rtw_8723x-objs  := rtw8723x.o
+          EOF
+              ;;
+            rtl8821cu)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8821c.o rtw_8821cu.o
+          rtw_8821c-objs  := rtw8821c.o rtw8821c_table.o
+          rtw_8821cu-objs := rtw8821cu.o
+          EOF
+              ;;
+            rtl8822bu)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8822b.o rtw_8822bu.o
+          rtw_8822b-objs  := rtw8822b.o rtw8822b_table.o
+          rtw_8822bu-objs := rtw8822bu.o
+          EOF
+              ;;
+            rtl8822cu)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8822c.o rtw_8822cu.o
+          rtw_8822c-objs  := rtw8822c.o rtw8822c_table.o
+          rtw_8822cu-objs := rtw8822cu.o
+          EOF
+              ;;
+            rtl8812au)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8812a.o rtw_8812au.o rtw_88xxa.o
+          rtw_8812a-objs  := rtw8812a.o rtw8812a_table.o
+          rtw_8812au-objs := rtw8812au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            rtl8814au)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8814a.o rtw_8814au.o rtw_88xxa.o
+          rtw_8814a-objs  := rtw8814a.o rtw8814a_table.o
+          rtw_8814au-objs := rtw8814au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            rtl8821au)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8821a.o rtw_8821au.o rtw_88xxa.o
+          rtw_8821a-objs  := rtw8821a.o rtw8821a_table.o
+          rtw_8821au-objs := rtw8821au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            all)
+              cat >> Makefile << 'EOF'
+          obj-m += rtw_8723d.o rtw_8723du.o rtw_8723x.o \
+                   rtw_8821c.o rtw_8821cu.o \
+                   rtw_8822b.o rtw_8822bu.o \
+                   rtw_8822c.o rtw_8822cu.o \
+                   rtw_8812a.o rtw_8812au.o \
+                   rtw_8814a.o rtw_8814au.o \
+                   rtw_8821a.o rtw_8821au.o rtw_88xxa.o
+          rtw_8723d-objs  := rtw8723d.o rtw8723d_table.o
+          rtw_8723du-objs := rtw8723du.o
+          rtw_8723x-objs  := rtw8723x.o
+          rtw_8821c-objs  := rtw8821c.o rtw8821c_table.o
+          rtw_8821cu-objs := rtw8821cu.o
+          rtw_8822b-objs  := rtw8822b.o rtw8822b_table.o
+          rtw_8822bu-objs := rtw8822bu.o
+          rtw_8822c-objs  := rtw8822c.o rtw8822c_table.o
+          rtw_8822cu-objs := rtw8822cu.o
+          rtw_8812a-objs  := rtw8812a.o rtw8812a_table.o
+          rtw_8812au-objs := rtw8812au.o
+          rtw_8814a-objs  := rtw8814a.o rtw8814a_table.o
+          rtw_8814au-objs := rtw8814au.o
+          rtw_8821a-objs  := rtw8821a.o rtw8821a_table.o
+          rtw_8821au-objs := rtw8821au.o
+          rtw_88xxa-objs  := rtw88xxa.o
+          EOF
+              ;;
+            *)
+              echo "::error::Unknown RTW88 driver $DRIVER"
+              exit 1
+              ;;
+          esac
+
+          echo "Building RTW88 modules against prepared kernel..."
+          make -j$(nproc) -C "$GITHUB_WORKSPACE/ks/out" M="$(pwd)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 CC=clang LD=ld.lld \
+            modules
+
+          KO_COUNT=$(find . -name "*.ko" | wc -l)
+          if [ "$KO_COUNT" -eq 0 ]; then
+            echo "::error::RTW88 build failed to produce any .ko file!"
+            exit 1
+          fi
+          find . -name "*.ko" -exec ls -la {} \;
+
+      - name: Show module_layout CRC
+        if: always()
+        working-directory: ks
+        run: |
+          echo "=== module_layout CRC (compare to your device!) ==="
+          grep -w module_layout out/Module.symvers || echo "not found"
+
+      - name: Collect modules
+        if: always()
+        run: |
+          mkdir -p ko
+          find ks/out -name "*.ko" \( -name "mac80211.ko" -o -name "cfg80211.ko" \) -exec cp {} ko/ \; || true
+          find oot -name "*.ko" -exec cp {} ko/ \;
+          cp ks/out/Module.symvers ko/ 2>/dev/null || true
+          echo "--- collected ---"; ls -la ko/
+
+      - name: Package Magisk/KernelSU module
+        id: pkg
+        run: |
+          set -e
+          COMMIT="${{ github.event.inputs.kcommit }}"
+          SHORT="$(echo "$COMMIT" | cut -c1-12)"
+          DRIVER="${{ github.event.inputs.driver }}"
+
+          case "$DRIVER" in
+            rtl8723du)
+              LEAF="rtw_8723du.ko"; DRVNAME="rtw_8723du"; USBID="0bda:d723" ;;
+            rtl8821cu)
+              LEAF="rtw_8821cu.ko"; DRVNAME="rtw_8821cu"; USBID="0bda:c821" ;;
+            rtl8822bu)
+              LEAF="rtw_8822bu.ko"; DRVNAME="rtw_8822bu"; USBID="0bda:b82c" ;;
+            rtl8822cu)
+              LEAF="rtw_8822cu.ko"; DRVNAME="rtw_8822cu"; USBID="0bda:c82c" ;;
+            rtl8812au)
+              LEAF="rtw_8812au.ko"; DRVNAME="rtw_8812au"; USBID="0bda:8812" ;;
+            rtl8814au)
+              LEAF="rtw_8814au.ko"; DRVNAME="rtw_8814au"; USBID="0bda:8813" ;;
+            rtl8821au)
+              LEAF="rtw_8821au.ko"; DRVNAME="rtw_8821au"; USBID="0bda:8811" ;;
+            all)
+              LEAF="rtw_8723du.ko"; DRVNAME="rtw_8723du"; USBID="0bda:d723" ;;
+            *)
+              echo "::error::Unsupported driver $DRIVER for packaging"
+              exit 1
+              ;;
+          esac
+
+          PKG="pkg"
+          rm -rf "$PKG"
+          mkdir -p "$PKG/modules" "$PKG/vendor/firmware/rtw88" "$PKG/system" "$PKG/META-INF/com/google/android"
+          ln -s ../vendor "$PKG/system/vendor"
+
+          # Modules from collected ko/
+          cp ko/*.ko "$PKG/modules/" 2>/dev/null || true
+          rm -f "$PKG/modules/cfg80211.ko"
+          cp ko/Module.symvers "$PKG/modules/" 2>/dev/null || true
+
+          # Stage firmware for KernelSU native /vendor/firmware mount (no firmware_class.path override)
+          if [ -d "oot/firmware" ]; then
+            cp oot/firmware/*.bin "$PKG/vendor/firmware/rtw88/" 2>/dev/null || true
+          fi
+
+          # module.prop following official format
+          cat > "$PKG/module.prop" <<PROP
+          id=gki_usb_wifi_${SHORT}_${DRIVER}
+          name=GKI USB Wi-Fi (${DRIVER})
+          version=${SHORT}
+          versionCode=1
+          author=markatsos, Rian-yes
+          description=Loads ${DRIVER} (RTW88) on kernel ACK commit ${SHORT}. Native /vendor/firmware mount and Action button toggle.
+          PROP
+          echo "actionIcon=" >> "$PKG/module.prop"
+
+          # customize.sh, service.sh, action.sh, uninstall.sh
+          cp drivers/rtl8723du-wifi/packaging/customize.sh "$PKG/customize.sh"
+          sed -e "s|__USB_ID__|$USBID|" \
+              -e "s|__DRV_KO__|$LEAF|" \
+              -e "s|__DRV_NAME__|$DRVNAME|" \
+              drivers/rtl8723du-wifi/packaging/service.sh > "$PKG/service.sh"
+          sed -e "s|__USB_ID__|$USBID|" \
+              -e "s|__DRV_NAME__|$DRVNAME|" \
+              drivers/rtl8723du-wifi/packaging/action.sh > "$PKG/action.sh"
+          sed -e "s|__DRV_NAME__|$DRVNAME|" \
+              drivers/rtl8723du-wifi/packaging/uninstall.sh > "$PKG/uninstall.sh"
+          chmod 755 "$PKG/customize.sh" "$PKG/service.sh" "$PKG/uninstall.sh" "$PKG/action.sh"
+
+          # Official Magisk/KernelSU/APatch installer shim
+          cat > "$PKG/META-INF/com/google/android/update-binary" <<'UB'
+          #!/sbin/sh
+          # Magisk module installer shim
+          umask 022
+          OUTFD=$2; ZIP=$3
+          . /data/adb/magisk/util_functions.sh 2>/dev/null || true
+          install_module
+          exit 0
+          UB
+          echo "#MAGISK" > "$PKG/META-INF/com/google/android/updater-script"
+
+          echo "module tree ready:"
+          find "$PKG" -maxdepth 2 -type f | sort
+          echo "zipname=gki-usb-wifi-${SHORT}-${DRIVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Magisk module (flashable as-is)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.zipname || 'magisk-module' }}
+          path: pkg/
+
+      - name: Upload raw modules
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: modules
+          path: ko/
