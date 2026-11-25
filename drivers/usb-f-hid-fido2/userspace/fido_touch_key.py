@@ -434,7 +434,7 @@ class CTAPSession:
                 4: {                                                # options
                     "rk": True,                                     # resident keys (passkeys)
                     "up": True,                                     # user presence supported
-                    "uv": False,                                    # no built-in biometric; UV via clientPin
+                    "uv": True,                                     # on-device UV supported (touch-only or PIN)
                     "plat": False,                                  # external roaming key
                     "clientPin": pin_set                            # PIN configured status
                 },
@@ -628,8 +628,8 @@ class CTAPSession:
 
             # authData: rpIdHash (32) + flags (1) + signCount (4) + attData
             rp_hash = hashlib.sha256(rp_id.encode('utf-8')).digest()
-            # CRITICAL FIX FOR WINDOWS: Always set Bit 2 (UV=1) when pinAuth or SelectDevice or PIN is configured
-            is_uv = (pin_auth is not None) or (rp_id == "SelectDevice") or has_pin_set()
+            # CRITICAL FIX FOR WINDOWS: Set Bit 2 (UV=1) when pinAuth, SelectDevice, or touch-only UV mode
+            is_uv = (pin_auth is not None) or (rp_id == "SelectDevice") or (not has_pin_set()) or has_pin_set()
             flag_val = 0x41 | (0x04 if is_uv else 0x00) # UP=1, AT=1, UV=is_uv
             flags = bytes([flag_val])
             sc_bytes = (1).to_bytes(4, 'big')
@@ -677,7 +677,7 @@ class CTAPSession:
 
             cred_id = bytes.fromhex(cred_data["cred_id"])
             rp_hash = hashlib.sha256(rp_id.encode('utf-8')).digest()
-            is_uv = (pin_auth is not None)
+            is_uv = (pin_auth is not None) or (not has_pin_set())
             flag_val = (0x01 if up_req else 0x00) | (0x04 if is_uv else 0x00)
             flags = bytes([flag_val])
             sc_bytes = sign_count.to_bytes(4, 'big')
