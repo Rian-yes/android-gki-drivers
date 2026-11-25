@@ -298,7 +298,7 @@ class CTAPSession:
         if not self.running:
             return False
         try:
-            _, writable, _ = select.select([], [self.fd], [], 1.5)
+            _, writable, _ = select.select([], [self.fd], [], 0.5)
             if not writable or not self.running:
                 return False
             self.fd.write(pkt)
@@ -377,12 +377,12 @@ class CTAPSession:
         t.start()
 
         if self.auto_touch:
-            print("[AUTO-TOUCH] Simulating golden disc touch in 0.3s...")
-            time.sleep(0.3)
+            print("[AUTO-TOUCH] Simulating golden disc touch...", flush=True)
+            time.sleep(0.05)
             stop_keepalive.set()
             t.join(timeout=1.0)
-            print(" [✓] Golden disc touched automatically! User Presence verified.")
-            print("═" * 70 + "\n")
+            print(" [✓] Golden disc touched automatically! User Presence verified.", flush=True)
+            print("═" * 70 + "\n", flush=True)
             return True
 
         # Interactive manual touch
@@ -426,7 +426,7 @@ class CTAPSession:
         # ----------------------------------------------------
         if ctap_cmd == 0x04:
             pin_set = has_pin_set()
-            print(f"[CTAP2] Host queried: authenticatorGetInfo (PIN configured: {pin_set})")
+            print(f"[CTAP2] Host queried: authenticatorGetInfo (PIN configured: {pin_set})", flush=True)
             info = {
                 1: ["U2F_V2", "FIDO_2_0"],                          # versions
                 2: ["credProtect", "hmac-secret"],                  # extensions
@@ -434,7 +434,7 @@ class CTAPSession:
                 4: {                                                # options
                     "rk": True,                                     # resident keys (passkeys)
                     "up": True,                                     # user presence supported
-                    "uv": True,                                     # on-device user verification supported
+                    "uv": False,                                    # no built-in biometric; UV via clientPin
                     "plat": False,                                  # external roaming key
                     "clientPin": pin_set                            # PIN configured status
                 },
@@ -587,10 +587,22 @@ class CTAPSession:
             user_display = user.get("displayName", user_name)
             user_id = user.get("id", b"\x00" * 16)
             client_hash = params.get(1, b"")
+            exclude_list = params.get(5, []) or []
+            options = params.get(7, {}) or {}
+            up_req = options.get("up", True)
             pin_auth = params.get(8, None)
 
+            if exclude_list and rp_id not in ("SelectDevice", ".dummy"):
+                existing, _ = find_credential(rp_id, exclude_list)
+                if existing:
+                    if up_req:
+                        self.request_user_presence(cid, rp_id, "Registration (Already Registered)", user_name)
+                    print(f"[CTAP2] Credential already exists for {rp_id} (CTAP2_ERR_CREDENTIAL_EXCLUDED)", flush=True)
+                    self.send_resp(cid, 0x90, bytes([0x19])) # CTAP2_ERR_CREDENTIAL_EXCLUDED
+                    return
+
             # Emulate touching golden disc
-            if not self.request_user_presence(cid, rp_id, "Registration (Create Passkey)", user_name):
+            if up_req and not self.request_user_presence(cid, rp_id, "Registration (Create Passkey)", user_name):
                 self.send_resp(cid, 0x90, bytes([0x27])) # CTAP2_ERR_USER_ACTION_TIMEOUT
                 return
 
@@ -642,27 +654,31 @@ class CTAPSession:
             rp_id = params.get(1, "")
             client_hash = params.get(2, b"")
             allow_list = params.get(3, [])
+            options = params.get(5, {}) or {}
+            up_req = options.get("up", True)
             pin_auth = params.get(6, None)
 
             cred_data, priv_key = find_credential(rp_id, allow_list)
             if not cred_data or not priv_key:
-                print(f"[!] No existing credential found for {rp_id}")
+                print(f"[!] No existing credential found for {rp_id}", flush=True)
                 self.send_resp(cid, 0x90, bytes([0x2E])) # CTAP2_ERR_NO_CREDENTIALS
                 return
 
             user_name = cred_data.get("user_name", "")
-            if not self.request_user_presence(cid, rp_id, "Login (Authenticate)", user_name):
-                self.send_resp(cid, 0x90, bytes([0x27])) # CTAP2_ERR_USER_ACTION_TIMEOUT
-                return
+            if up_req:
+                if not self.request_user_presence(cid, rp_id, "Login (Authenticate)", user_name):
+                    self.send_resp(cid, 0x90, bytes([0x27])) # CTAP2_ERR_USER_ACTION_TIMEOUT
+                    return
+                sign_count = cred_data.get("sign_count", 0) + 1
+                update_sign_count(rp_id, cred_data["cred_id"], sign_count)
+            else:
+                print(f"[CTAP2] Silent pre-flight check (up=False) for {rp_id}: found ({user_name})", flush=True)
+                sign_count = cred_data.get("sign_count", 0)
 
             cred_id = bytes.fromhex(cred_data["cred_id"])
-            sign_count = cred_data.get("sign_count", 0) + 1
-            update_sign_count(rp_id, cred_data["cred_id"], sign_count)
-
             rp_hash = hashlib.sha256(rp_id.encode('utf-8')).digest()
-            # CRITICAL FIX FOR WINDOWS: Always set Bit 2 (UV=1) when pinAuth or PIN is configured
-            is_uv = (pin_auth is not None) or has_pin_set()
-            flag_val = 0x01 | (0x04 if is_uv else 0x00) # UP=1, UV=is_uv
+            is_uv = (pin_auth is not None)
+            flag_val = (0x01 if up_req else 0x00) | (0x04 if is_uv else 0x00)
             flags = bytes([flag_val])
             sc_bytes = sign_count.to_bytes(4, 'big')
             auth_data = rp_hash + flags + sc_bytes
@@ -682,7 +698,8 @@ class CTAPSession:
 
             resp_cbor = cbor2.dumps(assertion_resp, canonical=True)
             self.send_resp(cid, 0x90, bytes([0x00]) + resp_cbor)
-            print(f"[+] Login signed successfully for {user_name} on {rp_id}!")
+            if up_req:
+                print(f"[+] Login signed successfully for {user_name} on {rp_id}!", flush=True)
         else:
             print(f"[-] Unknown CTAP2 cmd: 0x{ctap_cmd:02X}")
             self.send_resp(cid, 0x90, bytes([0x01])) # CTAP1_ERR_INVALID_COMMAND
@@ -717,6 +734,7 @@ class CTAPSession:
             elif cmd == 0x88:  # CTAPHID_WINK
                 self.send_resp(cid, 0x88, b"")
             elif cmd == 0x91:  # CTAPHID_CANCEL
+                print(f"[HID] Host sent CTAPHID_CANCEL (cid=0x{cid:08X})", flush=True)
                 if self.active_keepalive:
                     self.active_keepalive.set()
                 self.rx_buffer.clear()
@@ -724,7 +742,11 @@ class CTAPSession:
                 self.send_resp(cid, 0xBF, bytes([0x2D])) # ERR_KEEPALIVE_CANCEL / ack
             elif cmd == 0x90:  # CTAPHID_CBOR
                 if len(data) >= bcnt:
-                    self.handle_cbor(cid, data)
+                    try:
+                        self.handle_cbor(cid, data)
+                    except Exception as e:
+                        print(f"[!] CBOR error: {e}", flush=True)
+                        self.send_resp(cid, 0x90, bytes([0x12])) # CTAP2_ERR_INVALID_CBOR
                 else:
                     self.rx_cid = cid
                     self.rx_cmd = cmd
@@ -732,6 +754,7 @@ class CTAPSession:
                     self.rx_seq = 0
                     self.rx_buffer = bytearray(data)
             else:
+                print(f"[HID] Unsupported CTAPHID cmd=0x{cmd:02X} (cid=0x{cid:08X})", flush=True)
                 self.send_resp(cid, 0xBF, bytes([0x01])) # CTAPHID ERR_INVALID_CMD
         else:  # Continuation packet
             seq = pkt[4]
@@ -741,11 +764,19 @@ class CTAPSession:
                 self.rx_buffer.extend(pkt[5:5+chunk_len])
                 if len(self.rx_buffer) >= self.rx_len:
                     if self.rx_cmd == 0x90:
-                        self.handle_cbor(self.rx_cid, bytes(self.rx_buffer))
+                        try:
+                            self.handle_cbor(self.rx_cid, bytes(self.rx_buffer))
+                        except Exception as e:
+                            print(f"[!] CBOR error: {e}", flush=True)
+                            self.send_resp(self.rx_cid, 0x90, bytes([0x12]))
                     self.rx_buffer.clear()
                     self.rx_cid = None
 
 def run_authenticator_loop(auto_touch=False):
+    # Ensure no stale fido_touch_key.py instance is holding /dev/hidg0
+    my_pid = str(os.getpid())
+    parent_pid = str(os.getppid())
+    os.system(f"for p in $(pgrep -f fido_touch_key.py 2>/dev/null); do [ \"$p\" != \"{my_pid}\" ] && [ \"$p\" != \"{parent_pid}\" ] && kill -9 \"$p\" 2>/dev/null; done")
     hid_devices = glob.glob("/dev/hidg*")
     if not hid_devices:
         print("[*] Initializing USB gadget for this session...")
