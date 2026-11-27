@@ -178,8 +178,35 @@ def list_stored_credentials():
 # ConfigFS USB Gadget Management
 # ==========================================
 
-def setup_usb_gadget():
+_saved_usb_config = "mtp,adb"  # Will be overwritten with actual value at setup time
+
+def _getprop(key):
+    """Read an Android system property."""
+    import subprocess
+    try:
+        r = subprocess.run(["/system/bin/getprop", key], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+def _setprop(key, val):
+    """Set an Android system property."""
+    os.system(f'/system/bin/setprop {key} {val}')
+
+def _wait_usb_state(target, timeout=5.0):
+    """Poll getprop sys.usb.state until it matches target or timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = _getprop("sys.usb.state")
+        if state == target:
+            return True
+        time.sleep(0.1)
+    return False
+
+def setup_usb_gadget(force_rebind=False):
     """Ensure kernel module is loaded and ConfigFS gadget function is linked."""
+    global _saved_usb_config
+
     with open("/proc/modules", "r") as f:
         modules = f.read()
     if "usb_f_hid" not in modules and "usb_f_hid_fix" not in modules:
@@ -197,43 +224,60 @@ def setup_usb_gadget():
 
     gadget_dir = "/config/usb_gadget/g1"
     func_dir = f"{gadget_dir}/functions/hid_fix.0"
-    link_path = f"{gadget_dir}/configs/b.1/f_hid"
-    udc_path = f"{gadget_dir}/UDC"
+    cfg_dir = f"{gadget_dir}/configs/b.1"
+    link_path = f"{cfg_dir}/f_hid"
 
     if not os.path.exists(gadget_dir):
         print(f"[!] Gadget directory {gadget_dir} does not exist!")
         return False
 
     try:
-        # Check if already bound and operational
-        if os.path.islink(link_path) and glob.glob("/dev/hidg*"):
+        # Check if f_hid is already bound cleanly as the dedicated gadget function
+        other_funcs = [e for e in glob.glob(f"{cfg_dir}/f*") if os.path.basename(e) != "f_hid"]
+        if not force_rebind and not other_funcs and os.path.islink(link_path) and glob.glob("/dev/hidg*"):
             print("[✓] USB HID Gadget is already linked and active.")
             os.system("chmod 666 /dev/hidg* 2>/dev/null")
             return True
 
+        # Save current USB config for later restore
+        cur_cfg = _getprop("sys.usb.config")
+        if cur_cfg and cur_cfg != "none":
+            _saved_usb_config = cur_cfg
+            print(f"[*] Saved current USB config: {_saved_usb_config}")
+
+        print("[*] Switching USB gadget to dedicated FIDO2 HID mode...")
+
+        # Step 1: Prevent Android init from touching ConfigFS
+        _setprop("sys.usb.ffs.ready", "0")
+        _setprop("sys.usb.config", "none")
+
+        # Step 2: Wait for state to actually become 'none' (not fire-and-forget)
+        if not _wait_usb_state("none", timeout=5.0):
+            print("[!] Warning: sys.usb.state did not reach 'none' in 5s, proceeding anyway...")
+        time.sleep(0.3)  # Short settle after state transition
+
         if not os.path.exists(func_dir):
             os.mkdir(func_dir)
+            with open(f"{func_dir}/report_desc", "wb") as f:
+                f.write(FIDO_REPORT_DESC)
+            with open(f"{func_dir}/report_length", "w") as f:
+                f.write("64\n")
+            with open(f"{func_dir}/subclass", "w") as f:
+                f.write("0\n")
+            with open(f"{func_dir}/protocol", "w") as f:
+                f.write("0\n")
 
-        with open(f"{func_dir}/report_desc", "wb") as f:
-            f.write(FIDO_REPORT_DESC)
-        with open(f"{func_dir}/report_length", "w") as f:
-            f.write("64\n")
-        with open(f"{func_dir}/subclass", "w") as f:
-            f.write("0\n")
-        with open(f"{func_dir}/protocol", "w") as f:
-            f.write("0\n")
-
-        # Execute safe ConfigFS unbind, symlink, and rebind sequence
+        # Step 3: Remove all existing function links, bind only f_hid
         os.system(
             '/system/bin/sh -c \''
-            'echo "" > /config/usb_gadget/g1/UDC && '
-            'rm -f /config/usb_gadget/g1/configs/b.1/f_hid && '
+            ': > /config/usb_gadget/g1/UDC && '
+            'for f in /config/usb_gadget/g1/configs/b.1/f*; do rm -f "$f" 2>/dev/null; done && '
             'ln -s /config/usb_gadget/g1/functions/hid_fix.0 /config/usb_gadget/g1/configs/b.1/f_hid && '
             'echo "13200000.dwc3" > /config/usb_gadget/g1/UDC && '
             'chmod 666 /dev/hidg*'
             '\''
         )
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         devices = glob.glob("/dev/hidg*")
         if devices:
@@ -249,20 +293,26 @@ def setup_usb_gadget():
 
 def teardown_usb_gadget(rm_module=False):
     """Unlinks f_hid cleanly from ConfigFS and restores normal phone USB."""
+    global _saved_usb_config
     gadget_dir = "/config/usb_gadget/g1"
     link_path = f"{gadget_dir}/configs/b.1/f_hid"
+
+    restore_cfg = _saved_usb_config if _saved_usb_config and _saved_usb_config != "none" else "mtp,adb"
 
     try:
         if os.path.islink(link_path):
             cmd = (
-                'echo "" > /config/usb_gadget/g1/UDC && '
-                'rm -f /config/usb_gadget/g1/configs/b.1/f_hid && '
-                'echo "13200000.dwc3" > /config/usb_gadget/g1/UDC'
+                ': > /config/usb_gadget/g1/UDC && '
+                'rm -f /config/usb_gadget/g1/configs/b.1/f_hid'
             )
             if rm_module:
                 cmd += ' && rmmod usb_f_hid_fix'
             os.system(f"/system/bin/sh -c '{cmd}' 2>/dev/null")
-            print("[✓] USB HID Gadget unlinked cleanly. Samsung USB HAL restored.")
+
+        # Restore original USB config and re-enable init trigger
+        _setprop("sys.usb.config", restore_cfg)
+        _setprop("sys.usb.ffs.ready", "1")
+        print(f"[✓] USB HID Gadget unlinked cleanly. Restored USB config: {restore_cfg}")
     except Exception as e:
         print(f"[!] Teardown note: {e}")
 
@@ -371,7 +421,7 @@ class CTAPSession:
         def keepalive_worker():
             while not stop_keepalive.is_set() and self.running:
                 self.send_keepalive(cid, 0x02)  # 0x02 = STATUS_UPNEEDED
-                time.sleep(0.15)
+                time.sleep(0.08)  # FIDO2 spec: keepalive every ≤100ms
 
         t = threading.Thread(target=keepalive_worker, daemon=True)
         t.start()
@@ -715,6 +765,7 @@ class CTAPSession:
             data = pkt[7:7+min(bcnt, 57)]
 
             if cmd == 0x86:    # CTAPHID_INIT
+                print(f"[HID] RX CTAPHID_INIT (cid=0x{cid:08X})", flush=True)
                 nonce = pkt[7:15]
                 if cid == 0xFFFFFFFF:
                     alloc_cid = struct.pack(">I", self.next_cid)
@@ -777,16 +828,13 @@ def run_authenticator_loop(auto_touch=False):
     my_pid = str(os.getpid())
     parent_pid = str(os.getppid())
     os.system(f"for p in $(pgrep -f fido_touch_key.py 2>/dev/null); do [ \"$p\" != \"{my_pid}\" ] && [ \"$p\" != \"{parent_pid}\" ] && kill -9 \"$p\" 2>/dev/null; done")
+    if not setup_usb_gadget():
+        print("[!] Could not initialize USB gadget.")
+        return
     hid_devices = glob.glob("/dev/hidg*")
     if not hid_devices:
-        print("[*] Initializing USB gadget for this session...")
-        if not setup_usb_gadget():
-            print("[!] Could not initialize USB gadget.")
-            return
-        hid_devices = glob.glob("/dev/hidg*")
-        if not hid_devices:
-            print("[!] Still no /dev/hidg* device available.")
-            return
+        print("[!] Still no /dev/hidg* device available.")
+        return
 
     hid_dev = hid_devices[0]
 
@@ -839,7 +887,7 @@ def run_authenticator_loop(auto_touch=False):
     was_disconnected = False
     while session.running and not interrupted[0]:
         try:
-            readable, _, err = select.select([fd], [], [fd], 0.5)
+            readable, _, err = select.select([fd], [], [fd], 0.05)  # 50ms for fast CTAPHID response
             if not session.running or interrupted[0]:
                 break
             if not readable and not err:
@@ -860,11 +908,11 @@ def run_authenticator_loop(auto_touch=False):
                 if not was_disconnected:
                     print("[!] USB suspended or bus reset. Waiting cleanly for host...", flush=True)
                     was_disconnected = True
-                time.sleep(0.5)
+                time.sleep(0.1)
             else:
                 if session.running:
                     print(f"[!] Session note: {e}", flush=True)
-                time.sleep(0.5)
+                time.sleep(0.1)
 
     cleanup()
     signal.signal(signal.SIGINT, orig_sigint)

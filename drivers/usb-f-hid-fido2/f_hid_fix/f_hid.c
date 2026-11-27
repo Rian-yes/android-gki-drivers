@@ -230,10 +230,7 @@ static struct usb_endpoint_descriptor hidg_fs_in_ep_desc = {
 	.bEndpointAddress	= USB_DIR_IN,
 	.bmAttributes		= USB_ENDPOINT_XFER_INT,
 	/*.wMaxPacketSize	= DYNAMIC */
-	.bInterval		= 10, /* FIXME: Add this field in the
-				       * HID gadget configuration?
-				       * (struct hidg_func_descriptor)
-				       */
+	.bInterval		= 1, /* 1ms polling for responsive FIDO2 HID */
 };
 
 static struct usb_endpoint_descriptor hidg_fs_out_ep_desc = {
@@ -242,10 +239,7 @@ static struct usb_endpoint_descriptor hidg_fs_out_ep_desc = {
 	.bEndpointAddress	= USB_DIR_OUT,
 	.bmAttributes		= USB_ENDPOINT_XFER_INT,
 	/*.wMaxPacketSize	= DYNAMIC */
-	.bInterval		= 10, /* FIXME: Add this field in the
-				       * HID gadget configuration?
-				       * (struct hidg_func_descriptor)
-				       */
+	.bInterval		= 1, /* 1ms polling for responsive FIDO2 HID */
 };
 
 static struct usb_descriptor_header *hidg_fs_descriptors_intout[] = {
